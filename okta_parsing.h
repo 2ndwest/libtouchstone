@@ -1,7 +1,7 @@
 #pragma once
 
 #include "utils.h"
-#include "json.h"
+#include <json.h>
 #include <lexbor/html/parser.h>
 #include <lexbor/dom/interfaces/element.h>
 #include <lexbor/dom/interfaces/attr.h>
