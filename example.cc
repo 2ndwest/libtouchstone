@@ -1,5 +1,5 @@
 #include "libtouchstone.h"
-#include "json.cpp"
+#include "json.h"
 #include <cstdio>
 #include <fstream>
 
