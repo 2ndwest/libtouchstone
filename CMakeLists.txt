@@ -20,6 +20,7 @@ if(LIBTOUCHSTONE_FETCH_DEPS)
   if(NOT TARGET json)
     FetchContent_Declare(json_cpp GIT_REPOSITORY https://github.com/jart/json.cpp GIT_TAG main)
     FetchContent_MakeAvailable(json_cpp)
+    target_include_directories(json PUBLIC ${json_cpp_SOURCE_DIR})
   endif()
 endif()
 
