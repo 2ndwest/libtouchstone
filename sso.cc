@@ -6,8 +6,15 @@ namespace libtouchstone {
 
 using Json = jt::Json;
 
+// IMPORTANT: We use PostRedirectFlags::NONE so that when curl follows 3XX redirects
+// after a POST request, it converts the request method to GET (standard HTTP behavior).
+// With POST_ALL (cpr default at time of writing), curl always maintains the POST method
+// after redirects, which breaks the SSO flows that expect GET requests after redirects.
+static const cpr::Redirect REDIRECT_CONFIG{cpr::PostRedirectFlags::NONE};
+
 // Given Touchstone html, attempts to perform Touchstone SSO redirect
-// by extracting form fields and POSTing to the right location.
+// by extracting form fields and POSTing to the right location. May be
+// called without calling perform_okta first, if the user has valid cookies.
 cpr::Response perform_final_idp_redirect(cpr::Session& s, const std::string& touchstone_html, const AuthOptions& opts) {
     ExtractedFormData form = extract_form(touchstone_html);
 
@@ -21,7 +28,7 @@ cpr::Response perform_final_idp_redirect(cpr::Session& s, const std::string& tou
     s.SetBody(cpr::Body{"RelayState=" + cpr::util::urlEncode(form.fields["RelayState"]) +
         "&SAMLResponse=" + cpr::util::urlEncode(form.fields["SAMLResponse"])});
     s.SetHeader(cpr::Header{{"Content-Type", "application/x-www-form-urlencoded"}});
-
+    s.SetRedirect(REDIRECT_CONFIG); // applies to the rest of the session
     cpr::Response r = s.Post();
 
     if (contains(r.url.str(), "idp.mit.edu")) return make_error(OKTA_FLOW_ERROR, "SAML redirect failed");
@@ -71,7 +78,7 @@ static cpr::Response perform_duo(cpr::Session& s, const std::string& duo_url,
     s.SetUrl(cpr::Url{duo_url});
     s.SetBody(cpr::Body{duo_prompt_data});
     s.SetHeader(cpr::Header{{"Content-Type", "application/x-www-form-urlencoded"}});
-    s.SetRedirect(cpr::Redirect{-1, true, false, cpr::PostRedirectFlags::NONE});
+    s.SetRedirect(REDIRECT_CONFIG); // applies to the rest of the session
     cpr::Response hc = s.Post();
 
     // First one should be healthcheck
@@ -87,7 +94,6 @@ static cpr::Response perform_duo(cpr::Session& s, const std::string& duo_url,
     // Post again
     s.SetUrl(cpr::Url{duo_url});
     s.SetBody(cpr::Body{duo_prompt_data});
-    s.SetRedirect(cpr::Redirect{-1, true, false, cpr::PostRedirectFlags::NONE});
     cpr::Response r = s.Post();
 
     // Check if we're already authenticated (cached Duo cookie)
@@ -221,6 +227,7 @@ cpr::Response perform_okta(cpr::Session& s, const std::string& touchstone_proxy_
     s.SetUrl(cpr::Url{"https://okta.mit.edu/idp/idx/introspect"});
     s.SetBody(cpr::Body{"{\"stateToken\":\"" + state_token + "\"}"});
     s.SetHeader(cpr::Header{{"Content-Type", "application/ion+json; okta-version=1.0.0"}});
+    s.SetRedirect(REDIRECT_CONFIG); // applies to the rest of the session
     cpr::Response r = s.Post();
 
     // # Only allow up to 5 remediations for now
@@ -242,11 +249,9 @@ cpr::Response perform_okta(cpr::Session& s, const std::string& touchstone_proxy_
             s.SetUrl(cpr::Url{rem.url});
             s.SetBody(cpr::Body{rem.data.toString()});
             s.SetHeader(cpr::Header{{"Content-Type", "application/json"}});
-            s.SetRedirect(cpr::Redirect{true});
             r = s.Post();
         } else if (rem.method == "GET") {
             s.SetUrl(cpr::Url{rem.url});
-            s.SetRedirect(cpr::Redirect{true});
             r = s.Get();
         }
     }

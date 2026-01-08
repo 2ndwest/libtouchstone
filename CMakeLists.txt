@@ -37,5 +37,5 @@ add_library(libtouchstone::libtouchstone ALIAS libtouchstone)
 # Only build the example when this is the top-level project.
 if(PROJECT_IS_TOP_LEVEL)
   add_executable(example example.cc)
-  target_link_libraries(example libtouchstone)
+  target_link_libraries(example libtouchstone json)
 endif()
