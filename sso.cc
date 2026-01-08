@@ -25,13 +25,22 @@ cpr::Response perform_final_idp_redirect(cpr::Session& s, const std::string& tou
     vlog(opts, "Shib: Posting SSO redirect to %s", form.action.c_str());
 
     s.SetUrl(cpr::Url{form.action});
-    s.SetBody(cpr::Body{"RelayState=" + cpr::util::urlEncode(form.fields["RelayState"]) +
-        "&SAMLResponse=" + cpr::util::urlEncode(form.fields["SAMLResponse"])});
     s.SetHeader(cpr::Header{{"Content-Type", "application/x-www-form-urlencoded"}});
+    s.SetBody(cpr::Body{
+        "RelayState=" + cpr::util::urlEncode(form.fields["RelayState"]) +
+        "&SAMLResponse=" + cpr::util::urlEncode(form.fields["SAMLResponse"])
+    });
     s.SetRedirect(REDIRECT_CONFIG); // applies to the rest of the session
     cpr::Response r = s.Post();
 
-    if (contains(r.url.str(), "idp.mit.edu")) return make_error(OKTA_FLOW_ERROR, "SAML redirect failed");
+    // Check if we got another SAML form (chained redirect through idp)
+    if (contains(r.url.str(), "idp.mit.edu")) {
+        if (contains(r.text, "SAMLResponse")) {
+            vlog(opts, "Shib: Got another SAML form, recursing...");
+            return perform_final_idp_redirect(s, r.text, opts);
+        }
+        return make_error(OKTA_FLOW_ERROR, "SSO redirect unsuccessful");
+    }
 
     vlog(opts, "Shib: SSO redirect successful!");
     return r;

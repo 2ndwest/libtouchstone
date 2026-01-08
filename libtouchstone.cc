@@ -31,16 +31,22 @@ cpr::Response authenticate(cpr::Session& s, const char* url, const char* usernam
         return r;
     }
 
-    // Okta flow
-    if (contains(effective_url, "okta.mit.edu/app")) {
-        vlog(opts, "libtouchstone: performing Okta flow");
-        return perform_okta(s, r.text, username, password, opts);
-    }
-
     // SSO redirect (cookies valid but need redirect)
     if (contains(effective_url, "idp.mit.edu/idp/profile/SAML2")) {
         vlog(opts, "libtouchstone: cookies valid, performing SSO redirect");
         return perform_final_idp_redirect(s, r.text, opts);
+    }
+
+    // Okta flow
+    if (contains(effective_url, "okta.mit.edu/app")) {
+        // When cookies are stale, Okta may just show an interstitial
+        // page with a SAML form instead of the login page with oktaData.
+        if (contains(r.text, "SAMLResponse")) {
+            vlog(opts, "libtouchstone: sent directly to SAML form");
+            return perform_final_idp_redirect(s, r.text, opts);
+        }
+        vlog(opts, "libtouchstone: performing Okta flow");
+        return perform_okta(s, r.text, username, password, opts);
     }
 
     return make_error(OKTA_FLOW_ERROR, "Unknown authentication state");
