@@ -6,7 +6,7 @@ namespace libtouchstone {
 
 using Json = jt::Json;
 
-// IMPORTANT: We use PostRedirectFlags::NONE so that when curl follows 3XX redirects
+// IMPORTANT: We use PostRedirectFlags::NONE so that when we follow 301/302/303 redirects
 // after a POST request, it converts the request method to GET (standard HTTP behavior).
 // With POST_ALL (cpr default at time of writing), curl always maintains the POST method
 // after redirects, which breaks the SSO flows that expect GET requests after redirects.
