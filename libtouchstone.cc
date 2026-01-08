@@ -27,18 +27,19 @@ cpr::Response authenticate(cpr::Session& s, const char* url, const char* usernam
 
     // Check if already authenticated
     if (!contains(effective_url, "idp.mit.edu") && !contains(effective_url, "okta.mit.edu")) {
-        vlog(opts, "Already authenticated (cookies valid)");
+        vlog(opts, "libtouchstone: already authenticated (cookies valid)");
         return r;
     }
 
     // Okta flow
     if (contains(effective_url, "okta.mit.edu/app")) {
+        vlog(opts, "libtouchstone: performing Okta flow");
         return perform_okta(s, r.text, username, password, opts);
     }
 
     // SSO redirect (cookies valid but need redirect)
     if (contains(effective_url, "idp.mit.edu/idp/profile/SAML2")) {
-        vlog(opts, "Touchstone cookies valid, performing SSO redirect");
+        vlog(opts, "libtouchstone: cookies valid, performing SSO redirect");
         return perform_final_idp_redirect(s, r.text, opts);
     }
 
