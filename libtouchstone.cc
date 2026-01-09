@@ -25,7 +25,7 @@ cpr::Response authenticate(cpr::Session& s, const char* url, const char* usernam
 
     std::string effective_url = r.url.str();
 
-    // Check if already authenticated
+    // Check if already authenticated (cookies valid)
     if (!contains(effective_url, "idp.mit.edu") && !contains(effective_url, "okta.mit.edu")) {
         vlog(opts, "libtouchstone: already authenticated (cookies valid)");
         return r;
@@ -37,10 +37,10 @@ cpr::Response authenticate(cpr::Session& s, const char* url, const char* usernam
         return perform_final_idp_redirect(s, r.text, opts);
     }
 
-    // Okta flow
+    // Okta flow (cookies invalid or slightly stale)
     if (contains(effective_url, "okta.mit.edu/app")) {
-        // When cookies are stale, Okta may just show an interstitial
-        // page with a SAML form instead of the login page with oktaData.
+        // When cookies are slightly stale, Okta may just show an interstitial
+        // page with a SAML form instead of the full login page with oktaData.
         if (contains(r.text, "SAMLResponse")) {
             vlog(opts, "libtouchstone: sent directly to SAML form");
             return perform_final_idp_redirect(s, r.text, opts);
