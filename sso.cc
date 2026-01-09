@@ -25,11 +25,11 @@ cpr::Response perform_final_idp_redirect(cpr::Session& s, const std::string& tou
     vlog(opts, "Shib: Posting SSO redirect to %s", form.action.c_str());
 
     s.SetUrl(cpr::Url{form.action});
-    s.SetHeader(cpr::Header{{"Content-Type", "application/x-www-form-urlencoded"}});
     s.SetBody(cpr::Body{
         "RelayState=" + cpr::util::urlEncode(form.fields["RelayState"]) +
         "&SAMLResponse=" + cpr::util::urlEncode(form.fields["SAMLResponse"])
     });
+    s.SetHeader(cpr::Header{{"Content-Type", "application/x-www-form-urlencoded"}});
     s.SetRedirect(REDIRECT_CONFIG); // applies to the rest of the session
     cpr::Response r = s.Post();
 
@@ -103,6 +103,7 @@ static cpr::Response perform_duo(cpr::Session& s, const std::string& duo_url,
     // Post again
     s.SetUrl(cpr::Url{duo_url});
     s.SetBody(cpr::Body{duo_prompt_data});
+    s.SetHeader(cpr::Header{{"Content-Type", "application/x-www-form-urlencoded"}});
     cpr::Response r = s.Post();
 
     // Check if we're already authenticated (cached Duo cookie)
