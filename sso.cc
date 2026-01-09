@@ -51,10 +51,10 @@ static cpr::Response perform_duo(cpr::Session& s, const std::string& duo_url,
                                   const std::string& duo_html, const AuthOptions& opts) {
     vlog(opts, "Duo: Starting authentication");
 
-    std::string domain = regex_extract(duo_url, R"(https://([^/]+))");
-    std::string sid = regex_extract(duo_url, R"(sid=([^&]+))");
+    std::string duo_domain = regex_extract(duo_url, R"(https://([^/]+))");
+    std::string duo_sid = regex_extract(duo_url, R"(sid=([^&]+))");
 
-    if (domain.empty() || sid.empty()) return make_error(DUO_FLOW_ERROR, "Can't extract sid and transaction from redirect URL");
+    if (duo_domain.empty() || duo_sid.empty()) return make_error(DUO_FLOW_ERROR, "Can't extract sid and transaction from redirect URL");
 
     ExtractedFormData form = extract_form(duo_html, "plugin_form");
     std::string duo_tx = form.fields["tx"];
@@ -94,10 +94,10 @@ static cpr::Response perform_duo(cpr::Session& s, const std::string& duo_url,
     if (!contains(hc.url.str(), "/frame/v4/preauth/healthcheck")) return make_error(DUO_FLOW_ERROR, "Didn't reach Duo healthcheck endpoint");
 
     // GET the data endpoint
-    s.SetUrl(cpr::Url{"https://" + domain + "/frame/v4/preauth/healthcheck/data?sid=" + sid});
+    s.SetUrl(cpr::Url{"https://" + duo_domain + "/frame/v4/preauth/healthcheck/data?sid=" + duo_sid});
     s.Get();
     // and GET the return endpoint
-    s.SetUrl(cpr::Url{"https://" + domain + "/frame/v4/return?sid=" + sid});
+    s.SetUrl(cpr::Url{"https://" + duo_domain + "/frame/v4/return?sid=" + duo_sid});
     s.Get();
 
     // Post again
@@ -125,14 +125,14 @@ static cpr::Response perform_duo(cpr::Session& s, const std::string& duo_url,
 
     cpr::Header extra_prompt_headers{
         {"Content-Type", "application/x-www-form-urlencoded; charset=UTF-8"},
-        {"Referer", "https://" + domain + "/frame/v4/auth/prompt?sid=" + sid},
+        {"Referer", "https://" + duo_domain + "/frame/v4/auth/prompt?sid=" + duo_sid},
         {"X-Requested-With", "XMLHttpRequest"},
         {"X-Xsrftoken", xsrf},
-        {"Origin", "https://" + domain}
+        {"Origin", "https://" + duo_domain}
     };
 
     // Get the device ID
-    s.SetUrl(cpr::Url{"https://" + domain + "/frame/v4/auth/prompt/data?post_auth_action=OIDC_EXIT&sid=" + sid});
+    s.SetUrl(cpr::Url{"https://" + duo_domain + "/frame/v4/auth/prompt/data?post_auth_action=OIDC_EXIT&sid=" + duo_sid});
     s.SetHeader(extra_prompt_headers);
     r = s.Get();
 
@@ -143,8 +143,8 @@ static cpr::Response perform_duo(cpr::Session& s, const std::string& duo_url,
     // POST to send the push
     const char* factor = (opts.twofactor == 1) ? "Phone+Call" : "Duo+Push";
     if (opts.twofactor == 1) return make_error(DUO_FLOW_ERROR, "Phone call 2FA factor is not currently supported"); // TODO
-    s.SetUrl(cpr::Url{"https://" + domain + "/frame/v4/prompt"});
-    s.SetBody(cpr::Body{"device=phone1&factor=" + std::string(factor) + "&postAuthDestination=OIDC_EXIT&sid=" + sid});
+    s.SetUrl(cpr::Url{"https://" + duo_domain + "/frame/v4/prompt"});
+    s.SetBody(cpr::Body{"device=phone1&factor=" + std::string(factor) + "&postAuthDestination=OIDC_EXIT&sid=" + duo_sid});
     s.SetHeader(extra_prompt_headers);
     r = s.Post();
 
@@ -157,8 +157,8 @@ static cpr::Response perform_duo(cpr::Session& s, const std::string& duo_url,
     vlog(opts, "Duo: Sent %s request, waiting for approval...", factor);
 
     // Do a first request (this returns the info 'Pushed a login request to your device')
-    s.SetUrl(cpr::Url{"https://" + domain + "/frame/v4/status"});
-    s.SetBody(cpr::Body{"sid=" + sid + "&txid=" + txid});
+    s.SetUrl(cpr::Url{"https://" + duo_domain + "/frame/v4/status"});
+    s.SetBody(cpr::Body{"sid=" + duo_sid + "&txid=" + txid});
     s.SetHeader(extra_prompt_headers);
     r = s.Post();
 
@@ -170,8 +170,8 @@ static cpr::Response perform_duo(cpr::Session& s, const std::string& duo_url,
     vlog(opts, "Duo: Successfully pushed Duo push request. Blocking until response...");
 
     // Second status check (blocks until user responds)
-    s.SetUrl(cpr::Url{"https://" + domain + "/frame/v4/status"});
-    s.SetBody(cpr::Body{"sid=" + sid + "&txid=" + txid});
+    s.SetUrl(cpr::Url{"https://" + duo_domain + "/frame/v4/status"});
+    s.SetBody(cpr::Body{"sid=" + duo_sid + "&txid=" + txid});
     s.SetHeader(extra_prompt_headers);
     r = s.Post();
 
@@ -184,7 +184,7 @@ static cpr::Response perform_duo(cpr::Session& s, const std::string& duo_url,
     vlog(opts, "Duo: Second factor auth successful!");
 
     // Post to the log endpoint
-    s.SetUrl(cpr::Url{"https://" + domain + "/frame/prompt/v4/log_analytic"});
+    s.SetUrl(cpr::Url{"https://" + duo_domain + "/frame/prompt/v4/log_analytic"});
     s.SetBody(cpr::Body{
         "action=1"
         "&page=/frame/v4/auth/prompt"
@@ -195,7 +195,7 @@ static cpr::Response perform_duo(cpr::Session& s, const std::string& duo_url,
         "&error_message=undefined"
         "&auth_method=" + std::string(factor) +
         "&auth_state=AUTH_SUCCESS"
-        "&sid=" + sid
+        "&sid=" + duo_sid
     });
     s.SetHeader(extra_prompt_headers);
     r = s.Post();
@@ -203,8 +203,8 @@ static cpr::Response perform_duo(cpr::Session& s, const std::string& duo_url,
     vlog(opts, "Duo: Exiting back to Touchstone");
 
     // Get the AUTH token
-    s.SetUrl(cpr::Url{"https://" + domain + "/frame/v4/oidc/exit"});
-    s.SetBody(cpr::Body{"sid=" + sid +
+    s.SetUrl(cpr::Url{"https://" + duo_domain + "/frame/v4/oidc/exit"});
+    s.SetBody(cpr::Body{"sid=" + duo_sid +
         "&txid=" + txid +
         "&factor=" + factor +
         "&device_key=" + device_id +
@@ -212,8 +212,8 @@ static cpr::Response perform_duo(cpr::Session& s, const std::string& duo_url,
         "&dampen_choice=true"});
     s.SetHeader(cpr::Header{
         {"Content-Type", "application/x-www-form-urlencoded; charset=UTF-8"},
-        {"Origin", "https://" + domain},
-        {"Referer", "https://" + domain + "/frame/v4/auth/prompt?sid=" + sid}
+        {"Origin", "https://" + duo_domain},
+        {"Referer", "https://" + duo_domain + "/frame/v4/auth/prompt?sid=" + duo_sid}
     });
     r = s.Post();
 
