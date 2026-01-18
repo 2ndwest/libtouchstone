@@ -28,19 +28,10 @@ inline const std::vector<std::string> BLACKLISTED_REMEDIATIONS = {"unlock-accoun
 inline Remediation select_remediation(Json remediations, Json& available_data) {
     for (auto& remediation_option : remediations.getArray()) {
         std::string name = remediation_option["name"].getString();
-
-        // Check if blacklisted
-        bool blacklisted = false;
-        for (const auto& b : BLACKLISTED_REMEDIATIONS) {
-            if (name == b) {
-                blacklisted = true;
-                break;
-            }
-        }
-        if (blacklisted) continue;
-
         std::string url = remediation_option["href"].getString();
         std::string method = remediation_option["method"].getString();
+
+        if (contains(BLACKLISTED_REMEDIATIONS, name)) continue;
 
         // Check if we have all of the entries
         Json remediation_data;
@@ -58,10 +49,9 @@ inline Remediation select_remediation(Json remediations, Json& available_data) {
                     remediation_data[value_name] = available_data[value_name];
                 }
             }
-            if (!complete) {
-                continue;
-            }
+            if (!complete) continue;
         }
+
         // At this point, we have a complete remediation!
         return Remediation{name, url, method, std::move(remediation_data), true};
     }
