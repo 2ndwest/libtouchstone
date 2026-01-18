@@ -240,7 +240,14 @@ cpr::Response perform_okta(cpr::Session& s, const std::string& touchstone_proxy_
     s.SetRedirect(REDIRECT_CONFIG); // applies to the rest of the session
     cpr::Response r = s.Post();
 
-    // # Only allow up to 5 remediations for now
+    Json user_remediation_data;
+    user_remediation_data["identifier"] = std::string(user) + "@mit.edu";
+    user_remediation_data["rememberMe"] = true;
+    Json creds;
+    creds["passcode"] = std::string(pass);
+    user_remediation_data["credentials"] = std::move(creds);
+
+    // Only allow up to 5 remediations for now
     for (int i = 0; i < 5; i++) {
         if (r.status_code != 200) return make_error(OKTA_FLOW_ERROR, "Failed Okta remediation request");
 
@@ -250,17 +257,17 @@ cpr::Response perform_okta(cpr::Session& s, const std::string& touchstone_proxy_
         auto [parse_ok, remediation_data] = Json::parse(r.text);
         if (parse_ok != Json::success) return make_error(PARSE_ERROR, "Okta: Failed to parse introspect response");
 
-        Remediation rem = select_remediation(remediation_data["remediation"]["value"], user, pass);
+        Remediation rem = select_remediation(remediation_data["remediation"]["value"], user_remediation_data);
         if (!rem.valid) return make_error(OKTA_FLOW_ERROR, "Okta: No valid remediation found");
 
-        vlog(opts, "Okta (%s): %sing to %s", rem.name.c_str(), rem.method.c_str(), rem.url.c_str());
+        vlog(opts, "Okta (%s): %sing to %s", rem.name.c_str(), rem.http_method.c_str(), rem.url.c_str());
 
-        if (rem.method == "POST") {
+        if (rem.http_method == "POST") {
             s.SetUrl(cpr::Url{rem.url});
             s.SetBody(cpr::Body{rem.data.toString()});
             s.SetHeader(cpr::Header{{"Content-Type", "application/json"}});
             r = s.Post();
-        } else if (rem.method == "GET") {
+        } else if (rem.http_method == "GET") {
             s.SetUrl(cpr::Url{rem.url});
             r = s.Get();
         }

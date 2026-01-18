@@ -6,6 +6,7 @@
 #include <lexbor/dom/interfaces/element.h>
 #include <lexbor/dom/interfaces/attr.h>
 #include <string>
+#include <vector>
 #include <map>
 
 namespace libtouchstone {
@@ -15,44 +16,54 @@ using Json = jt::Json;
 struct Remediation {
     std::string name;
     std::string url;
-    std::string method;
+    std::string http_method;
     Json data;
     bool valid = false;
 };
 
-inline Remediation select_remediation(Json remediations, const char* user, const char* pass) {
-    for (auto& rem : remediations.getArray()) {
-        std::string name = rem["name"].getString();
-        if (name == "unlock-account") continue;
+inline const std::vector<std::string> BLACKLISTED_REMEDIATIONS = {"unlock-account"};
 
-        Remediation result;
-        result.name = name;
-        result.url = rem["href"].getString();
-        result.method = rem["method"].getString();
-        result.valid = true;
+// Given an Okta set of remediations and our available data,
+// returns a struct representing which remediation to take
+inline Remediation select_remediation(Json remediations, Json& available_data) {
+    for (auto& remediation_option : remediations.getArray()) {
+        std::string name = remediation_option["name"].getString();
 
-        if (rem.contains("value")) {
-            for (auto& field : rem["value"].getArray()) {
-                std::string field_name = field["name"].getString();
-
-                if (field.contains("value")) {
-                    result.data[field_name] = field["value"];
-                } else if (field_name == "identifier") {
-                    result.data[field_name] = std::string(user) + "@mit.edu";
-                } else if (field_name == "rememberMe") {
-                    result.data[field_name] = true;
-                } else if (field_name == "credentials") {
-                    Json creds;
-                    creds["passcode"] = std::string(pass);
-                    result.data[field_name] = std::move(creds);
-                } else {
-                    result.valid = false;
-                    break;
-                }
+        // Check if blacklisted
+        bool blacklisted = false;
+        for (const auto& b : BLACKLISTED_REMEDIATIONS) {
+            if (name == b) {
+                blacklisted = true;
+                break;
             }
         }
+        if (blacklisted) continue;
 
-        if (result.valid) return result;
+        std::string url = remediation_option["href"].getString();
+        std::string method = remediation_option["method"].getString();
+
+        // Check if we have all of the entries
+        Json remediation_data;
+        bool complete = true;
+        if (remediation_option.contains("value")) {
+            for (auto& value : remediation_option["value"].getArray()) {
+                std::string value_name = value["name"].getString();
+                if (value.contains("value")) {
+                    remediation_data[value_name] = value["value"];
+                } else {
+                    if (!available_data.contains(value_name)) {
+                        complete = false;
+                        break;
+                    }
+                    remediation_data[value_name] = available_data[value_name];
+                }
+            }
+            if (!complete) {
+                continue;
+            }
+        }
+        // At this point, we have a complete remediation!
+        return Remediation{name, url, method, std::move(remediation_data), true};
     }
     return Remediation{};
 }
