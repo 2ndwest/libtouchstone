@@ -243,9 +243,7 @@ cpr::Response perform_okta(cpr::Session& s, const std::string& touchstone_proxy_
     Json user_remediation_data;
     user_remediation_data["identifier"] = std::string(user) + "@mit.edu";
     user_remediation_data["rememberMe"] = true;
-    Json creds;
-    creds["passcode"] = std::string(pass);
-    user_remediation_data["credentials"] = std::move(creds);
+    user_remediation_data["credentials"]["passcode"] = std::string(pass);
 
     // Only allow up to 5 remediations for now
     for (int i = 0; i < 5; i++) {
