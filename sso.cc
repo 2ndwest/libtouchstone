@@ -1,6 +1,8 @@
 #include "sso.h"
 #include "okta_parsing.h"
 #include <cpr/util.h>
+#include <chrono>
+#include <thread>
 
 namespace libtouchstone {
 
@@ -46,180 +48,124 @@ cpr::Response perform_final_idp_redirect(cpr::Session& s, const std::string& tou
     return r;
 }
 
+// Duo's Universal Prompt is a JavaScript app, so instead of scraping it we drive the
+// JSON API it talks to. Every endpoint hangs off https://<host>/prompt/<akey>, is
+// authenticated by the authkey embedded in the page, and replies with a
+// {"stat": "OK", "response": {...}} envelope.
+
+// Duo's JS collects these from the browser; a fixed set is fine for a headless client.
+static const char* DUO_BROWSER_FEATURES =
+    R"({"touch_supported":false,"platform_authenticator_status":"unavailable",)"
+    R"("webauthn_supported":false,"screen_resolution_height":1080,)"
+    R"("screen_resolution_width":1920,"screen_color_depth":24,)"
+    R"("is_uvpa_available":false,"client_capabilities_uvpa":false})";
+
+// True once Okta has handed us off to a Duo Universal Prompt page.
+static bool is_duo_prompt(const std::string& url) {
+    return std::regex_search(url, std::regex(R"(^https://[^/]+/prompt/\w+)"));
+}
+
 // Performs Duo authentication, and returns the request that Duo responds with.
 static cpr::Response perform_duo(cpr::Session& s, const std::string& duo_url,
-                                  const std::string& duo_html, const AuthOptions& opts) {
-    vlog(opts, "Duo: Starting authentication");
+                                 const std::string& duo_html, const AuthOptions& opts) {
+    vlog(opts, "Duo: Starting Universal Prompt authentication");
 
-    std::string duo_domain = regex_extract(duo_url, R"(https://([^/]+))");
-    std::string duo_sid = regex_extract(duo_url, R"(sid=([^&]+))");
+    std::string host    = regex_extract(duo_url,  R"(https://([^/]+))");
+    std::string akey    = regex_extract(duo_html, R"rx(data-akey="([^"]+)")rx");
+    std::string authkey = regex_extract(duo_html, R"rx(data-authkey="([^"]+)")rx");
+    std::string trace   = regex_extract(duo_html, R"rx(data-req-trace-group="([^"]*)")rx");
 
-    if (duo_domain.empty() || duo_sid.empty()) return make_error(DUO_FLOW_ERROR, "Can't extract sid and transaction from redirect URL");
+    if (akey.empty() || authkey.empty())
+        return make_error(DUO_FLOW_ERROR, "Unable to locate Duo akey/authkey on the prompt page");
 
-    ExtractedFormData form = extract_form(duo_html, "plugin_form");
-    std::string duo_tx = form.fields["tx"];
-    std::string duo_akey = form.fields["akey"];
-    std::string duo_xsrf = form.fields["_xsrf"];
+    const std::string base  = "https://" + host + "/prompt/" + akey;
+    const std::string auth  = "authkey=" + cpr::util::urlEncode(authkey);
+    const std::string feats = "browser_features=" + cpr::util::urlEncode(DUO_BROWSER_FEATURES);
 
-    if (duo_tx.empty() || duo_akey.empty() || duo_xsrf.empty()) return make_error(DUO_FLOW_ERROR, "Unable to locate required Duo fields in first /frame/frameless/v4/auth call");
+    // Issue one prompt-API call, unwrapping the envelope into `out`. A body makes it a
+    // POST; like Duo's own client, we only send a Content-Type when there is one.
+    Json out;
+    auto call = [&](const std::string& url, const std::string& body = "") {
+        cpr::Header headers{{"X-Duo-Req-Trace-Group", trace}};
+        if (!body.empty()) headers["Content-Type"] = "application/json";
 
-    vlog(opts, "Duo: Decoded Touchstone transaction/akey/xsrf from redirect");
-
-    // Build the prompt data POST body
-    std::string duo_prompt_data =
-        "tx=" + cpr::util::urlEncode(duo_tx) +
-        "&parent=None"
-        "&_xsrf=" + cpr::util::urlEncode(duo_xsrf) +
-        "&version=v4"
-        "&akey=" + cpr::util::urlEncode(duo_akey) +
-        "&has_session_trust_analysis_feature=False"
-        "&session_trust_extension_id="
-        "&java_version="
-        "&screen_resolution_width=1920"
-        "&screen_resolution_height=1080"
-        "&color_depth=24"
-        "&is_cef_browser=false"
-        "&is_ipad_os=false"
-        "&is_user_verifying_platform_authenticator_available=false"
-        "&react_support=true";
-
-    // Post to Duo to load required cookies and such
-    s.SetUrl(cpr::Url{duo_url});
-    s.SetBody(cpr::Body{duo_prompt_data});
-    s.SetHeader(cpr::Header{{"Content-Type", "application/x-www-form-urlencoded"}});
-    s.SetRedirect(REDIRECT_CONFIG); // applies to the rest of the session
-    cpr::Response hc = s.Post();
-
-    // First one should be healthcheck
-    if (!contains(hc.url.str(), "/frame/v4/preauth/healthcheck")) return make_error(DUO_FLOW_ERROR, "Didn't reach Duo healthcheck endpoint");
-
-    // GET the data endpoint
-    s.SetUrl(cpr::Url{"https://" + duo_domain + "/frame/v4/preauth/healthcheck/data?sid=" + duo_sid});
-    s.Get();
-    // and GET the return endpoint
-    s.SetUrl(cpr::Url{"https://" + duo_domain + "/frame/v4/return?sid=" + duo_sid});
-    s.Get();
-
-    // Post again
-    s.SetUrl(cpr::Url{duo_url});
-    s.SetBody(cpr::Body{duo_prompt_data});
-    s.SetHeader(cpr::Header{{"Content-Type", "application/x-www-form-urlencoded"}});
-    cpr::Response r = s.Post();
-
-    // Check if we're already authenticated (cached Duo cookie)
-    if (contains(r.url.str(), "https://idp.mit.edu/idp/profile/SAML2/Redirect/SSO") ||
-        contains(r.url.str(), "https://okta.mit.edu")) {
-        // We're done!
-        vlog(opts, "Duo: 2FA not required: Duo cookie cached. Returning to Touchstone");
-        return r;
-    }
-
-    if (!contains(r.url.str(), "/frame/v4/auth/prompt")) return make_error(DUO_FLOW_ERROR, "Didn't reach the prompt Duo endpoint!");
-
-    // Extract XSRF token from response
-    std::string xsrf = regex_extract(r.text, R"(\"xsrf_token\":\s*\"([^\"]+)\")");
-    if (xsrf.empty()) return make_error(DUO_FLOW_ERROR, "Unable to extract XSRF token from prompt GET");
-
-    if (!opts.block) return make_error(WOULD_BLOCK, "Second factor auth required, but blocking is not allowed");
-
-    vlog(opts, "Duo: Second factor auth required: requested Duo auth page");
-
-    cpr::Header extra_prompt_headers{
-        {"Content-Type", "application/x-www-form-urlencoded; charset=UTF-8"},
-        {"Referer", "https://" + duo_domain + "/frame/v4/auth/prompt?sid=" + duo_sid},
-        {"X-Requested-With", "XMLHttpRequest"},
-        {"X-Xsrftoken", xsrf},
-        {"Origin", "https://" + duo_domain}
+        s.SetUrl(cpr::Url{url});
+        s.SetBody(cpr::Body{body});
+        s.SetHeader(headers);
+        cpr::Response r = body.empty() ? s.Get() : s.Post();
+        auto [parse_ok, envelope] = Json::parse(r.text);
+        if (parse_ok != Json::success || envelope["stat"].getString() != "OK") {
+            vlog(opts, "Duo: %s -> HTTP %ld: %.300s", url.c_str(), r.status_code, r.text.c_str());
+            return false;
+        }
+        out = std::move(envelope["response"]);
+        return true;
     };
 
-    // Get the device ID
-    s.SetUrl(cpr::Url{"https://" + duo_domain + "/frame/v4/auth/prompt/data?post_auth_action=OIDC_EXIT&sid=" + duo_sid});
-    s.SetHeader(extra_prompt_headers);
-    r = s.Get();
+    // Priming /auth/payload is mandatory: /pre_authn/evaluation 400s without it.
+    if (!call(base + "/auth/payload?" + auth + "&" + feats))
+        return make_error(DUO_FLOW_ERROR, "Duo rejected the initial payload request");
 
-    auto [parse_ok, prompt_data] = Json::parse(r.text);
-    if (parse_ok != Json::success || prompt_data["stat"].getString() != "OK") return make_error(DUO_FLOW_ERROR, "Unable to fetch Duo prompt data");
-    std::string device_id = prompt_data["response"]["phones"][0]["key"].getString();
+    // local_trust_choice=undecided declines the "trust this browser" offer, so no
+    // trusted-device cookie is minted and a second factor is required every run.
+    if (!call(base + "/pre_authn/evaluation?" + auth + "&" + feats + "&local_trust_choice=undecided"))
+        return make_error(DUO_FLOW_ERROR, "Duo rejected the pre-authentication request");
 
-    // POST to send the push
-    const char* factor = (opts.twofactor == 1) ? "Phone+Call" : "Duo+Push";
-    if (opts.twofactor == 1) return make_error(DUO_FLOW_ERROR, "Phone call 2FA factor is not currently supported"); // TODO
-    s.SetUrl(cpr::Url{"https://" + duo_domain + "/frame/v4/prompt"});
-    s.SetBody(cpr::Body{"device=phone1&factor=" + std::string(factor) + "&postAuthDestination=OIDC_EXIT&sid=" + duo_sid});
-    s.SetHeader(extra_prompt_headers);
-    r = s.Post();
+    // Anything other than "auth" means Duo is already satisfied (e.g. a remembered
+    // device), so we can skip straight to collecting the exit URL.
+    if (out["action"].getString() == "auth") {
+        if (opts.twofactor == 1) return make_error(DUO_FLOW_ERROR, "Phone call 2FA factor is not currently supported"); // TODO
+        if (!opts.block) return make_error(WOULD_BLOCK, "Second factor auth required, but blocking is not allowed");
 
-    vlog(opts, "Duo: Requested second factor authentication (%s)", factor);
+        std::string pkey;
+        for (auto& factor : out["auth_factors_context"]["available_unified_auth_factors"]["factors"].getArray()) {
+            if (factor["factor_type"].getString() == "push") {
+                pkey = factor["device_info"]["pkey"].getString();
+                break;
+            }
+        }
+        if (pkey.empty()) return make_error(DUO_FLOW_ERROR, "No Duo Push capable device is enrolled");
 
-    auto [push_ok, prompt_response] = Json::parse(r.text);
-    if (push_ok != Json::success || prompt_response["stat"].getString() != "OK") return make_error(DUO_FLOW_ERROR, "Unable to send two-factor request");
+        Json push;
+        push["authkey"] = authkey;
+        push["pkey"] = pkey;
+        push["otp_code"] = nullptr;
+        if (!call(base + "/auth/factors/push/auth", push.toString()))
+            return make_error(DUO_FLOW_ERROR, "Unable to send two-factor request");
 
-    std::string txid = prompt_response["response"]["txid"].getString();
-    vlog(opts, "Duo: Sent %s request, waiting for approval...", factor);
+        vlog(opts, "Duo: Sent Duo Push request, waiting for approval...");
 
-    // Do a first request (this returns the info 'Pushed a login request to your device')
-    s.SetUrl(cpr::Url{"https://" + duo_domain + "/frame/v4/status"});
-    s.SetBody(cpr::Body{"sid=" + duo_sid + "&txid=" + txid});
-    s.SetHeader(extra_prompt_headers);
-    r = s.Post();
+        // The status endpoint long-polls, reporting "STATUS" for as long as it waits;
+        // the sleep only guards against it returning immediately and spinning us.
+        const std::string status_url = base + "/auth/factors/push/status?" + auth +
+            "&push_txid=" + cpr::util::urlEncode(out["push_txid"].getString()) +
+            "&saw_good_news=false";
 
-    const char* expected_status = (opts.twofactor == 1) ? "calling" : "pushed";
+        std::string status;
+        for (int i = 0; i < 60; i++) {
+            if (i) std::this_thread::sleep_for(std::chrono::seconds(1));
+            if (!call(status_url)) return make_error(DUO_FLOW_ERROR, "Duo push status request failed");
 
-    auto [stat1_ok, stat1_json] = Json::parse(r.text);
-    if (stat1_ok != Json::success || stat1_json["response"]["status_code"].getString() != expected_status) return make_error(DUO_FLOW_ERROR, "Second-factor auth failed");
+            status = out["result"]["result"].getString();
+            if (status != "STATUS") break;  // SUCCESS, or a terminal outcome
+        }
+        if (status != "SUCCESS") return make_error(DUO_FLOW_ERROR, "User declined prompt or prompt timed out");
 
-    vlog(opts, "Duo: Successfully pushed Duo push request. Blocking until response...");
+        vlog(opts, "Duo: Second factor auth successful!");
+    }
 
-    // Second status check (blocks until user responds)
-    s.SetUrl(cpr::Url{"https://" + duo_domain + "/frame/v4/status"});
-    s.SetBody(cpr::Body{"sid=" + duo_sid + "&txid=" + txid});
-    s.SetHeader(extra_prompt_headers);
-    r = s.Post();
+    if (!call(base + "/auth/finalize_auth?" + auth))
+        return make_error(DUO_FLOW_ERROR, "Duo refused to finalize authentication");
 
-    auto [stat2_ok, post_prompt_response] = Json::parse(r.text);
-    if (stat2_ok != Json::success ||
-        post_prompt_response["stat"].getString() != "OK" ||
-        post_prompt_response["response"]["status_code"].getString() != "allow")
-        return make_error(DUO_FLOW_ERROR, "User declined prompt or prompt timed out");
+    std::string exit_url = out["url"].getString();
+    if (exit_url.empty()) return make_error(DUO_FLOW_ERROR, "Duo did not return an exit URL");
 
-    vlog(opts, "Duo: Second factor auth successful!");
+    vlog(opts, "Duo: Exiting back to Okta");
 
-    // Post to the log endpoint
-    s.SetUrl(cpr::Url{"https://" + duo_domain + "/frame/prompt/v4/log_analytic"});
-    s.SetBody(cpr::Body{
-        "action=1"
-        "&page=/frame/v4/auth/prompt"
-        "&target=trust+browser:+yes"
-        "&browser_language=en-US"
-        "&prompt_language=en"
-        "&is_error=false"
-        "&error_message=undefined"
-        "&auth_method=" + std::string(factor) +
-        "&auth_state=AUTH_SUCCESS"
-        "&sid=" + duo_sid
-    });
-    s.SetHeader(extra_prompt_headers);
-    r = s.Post();
-
-    vlog(opts, "Duo: Exiting back to Touchstone");
-
-    // Get the AUTH token
-    s.SetUrl(cpr::Url{"https://" + duo_domain + "/frame/v4/oidc/exit"});
-    s.SetBody(cpr::Body{"sid=" + duo_sid +
-        "&txid=" + txid +
-        "&factor=" + factor +
-        "&device_key=" + device_id +
-        "&_xsrf=" + cpr::util::urlEncode(xsrf) +
-        "&dampen_choice=true"});
-    s.SetHeader(cpr::Header{
-        {"Content-Type", "application/x-www-form-urlencoded; charset=UTF-8"},
-        {"Origin", "https://" + duo_domain},
-        {"Referer", "https://" + duo_domain + "/frame/v4/auth/prompt?sid=" + duo_sid}
-    });
-    r = s.Post();
-
-    vlog(opts, "Duo: Returned to Okta");
-    return r;
+    s.SetUrl(cpr::Url{exit_url});
+    s.SetBody(cpr::Body{""});
+    s.SetHeader(cpr::Header{});
+    return s.Get();
 }
 
 // Performs Touchstone login via thew new Okta. This handles redirects to/from Duo.
@@ -249,11 +195,13 @@ cpr::Response perform_okta(cpr::Session& s, const std::string& touchstone_proxy_
     for (int i = 0; i < 5; i++) {
         if (r.status_code != 200) return make_error(OKTA_FLOW_ERROR, "Failed Okta remediation request");
 
-        // If the URL is a Duo URL, we're done (url_matches_duo)
-        if (!regex_extract(r.url.str(), R"(https://([^/]+)([^?]+)\?sid=([^&]+)&tx=(.*))").empty()) break;
-
+        // Okta serves HTML rather than IDX JSON once it hands off, either to Duo or
+        // (when 2FA is already satisfied) straight back to itself.
         auto [parse_ok, remediation_data] = Json::parse(r.text);
-        if (parse_ok != Json::success) return make_error(PARSE_ERROR, "Okta: Failed to parse introspect response");
+        if (parse_ok != Json::success) {
+            if (is_duo_prompt(r.url.str()) || !extract_state_token(r.text).empty()) break;
+            return make_error(PARSE_ERROR, "Okta: response was neither IDX JSON nor a recognised handoff");
+        }
 
         Remediation rem = select_remediation(remediation_data["remediation"]["value"], user_remediation_data);
         if (!rem.valid) return make_error(OKTA_FLOW_ERROR, "Okta: No valid remediation found");
@@ -271,12 +219,14 @@ cpr::Response perform_okta(cpr::Session& s, const std::string& touchstone_proxy_
         }
     }
 
-    // Duo flow
-    cpr::Response duo_response = perform_duo(s, r.url.str(), r.text, opts);
-    if (duo_response.error) return duo_response;
+    // Duo flow (skipped entirely when Okta did not need a second factor)
+    if (is_duo_prompt(r.url.str())) {
+        r = perform_duo(s, r.url.str(), r.text, opts);
+        if (r.error) return r;
+    }
 
     // Extract the OktaData from the proxy request
-    state_token = extract_state_token(duo_response.text);
+    state_token = extract_state_token(r.text);
     if (state_token.empty()) return make_error(PARSE_ERROR, "Failed to extract state token after Duo");
 
     // Call back to the introspect endpoint to get the redirect
